@@ -1,0 +1,184 @@
+---
+# tasks file for k8s-minion
+
+- name: Disable SELINUX
+  lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=disabled'
+
+- name: Setenforce
+  selinux:
+    state: disabled
+
+- name: Disable firewalld
+  service: name=firewalld state=stopped enabled=no
+
+- name: Install Git
+  yum: pkg=git state=installed update_cache=true
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: Clone K8s repo
+  git:
+    repo: 'https://github.com/billhartcivica/kubernetes-docker-rpm-repo.git'
+    dest: /home/ansible/kubernetes-docker-rpm-repo
+
+- name: Copy repo to yum
+  command: cp /home/ansible/kubernetes-docker-rpm-repo/virt7-docker-common-release.repo /etc/yum.repos.d
+
+- name: Enable Docker-common repo
+  yum_repository:
+    name: virt7-docker-common-release
+    description: "Docker Common Packages"
+    baseurl: http://cbs.centos.org/repos/virt7-docker-common-release/x86_64/os/
+    enabled: yes
+
+- name: Install K8s Components
+  yum: pkg={{item}} state=installed
+  with_items:
+    - epel-release
+    - ntp
+    - kubernetes
+    - etcd
+    - flannel
+    - docker
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: enable ntp
+  systemd:
+    name: ntpd
+    state: started
+    enabled: True
+
+- name: Install Kompose
+  get_url:
+    url: https://github.com/kubernetes/kompose/releases/download/v1.16.0/kompose-linux-amd64
+    dest: /home/ansible/kompose
+
+- name: Set execute bit on kompose
+  file:
+    path: /home/ansible/kompose
+    owner: root
+    group: root
+    mode: 01755
+
+- name: Move kompose to /usr/local/bin
+  command: cp /home/ansible/kompose /usr/local/bin
+
+- name: Add hosts to /etc/hosts file
+  blockinfile:
+    dest: /etc/hosts
+    block: |
+      10.100.8.51   hs-wtg-lkub1
+      10.100.8.52   hs-wtg-ldok1
+      10.100.8.53   hs-wtg-ldok2
+    backup: no
+
+- name: Install Python-PIP
+  yum: pkg=python-pip state=installed
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: Install docker-compose
+  command: pip install docker-compose
+
+- name: Upgrade Python
+  command: yum upgrade python
+
+- name: Amend Kubernetes Config
+  replace:
+    path: /etc/kubernetes/config
+    regexp: '127.0.0.1'
+    replace: 'hs-wtg-lkub1'
+
+- name: Add etcd server config
+  lineinfile:
+    path: /etc/kubernetes/config
+    line: 'KUBE_ETCD_SERVERS="--etcd-servers=http://hs-wtg-lkub1:2379'
+
+- name: set timezone to Europe/London
+  timezone:
+    name: Europe/London
+
+- name: Amend Kubernetes kublet listening IP
+  replace:
+    path: /etc/kubernetes/kubelet
+    regexp: 'address=127.0.0.1'
+    replace: 'address=0.0.0.0'
+
+- name: Enabled kubelet port
+  replace:
+    path: /etc/kubernetes/kubelet
+    regexp: '# KUBELET_PORT'
+    replace: 'KUBELET_PORT'
+
+- name: Configure Kubelet hostname-override
+  replace:
+    path: /etc/kubernetes/kubelet
+    regexp: 'hostname-override=127.0.0.1'
+    replace: 'hostname-override={{ ansible_hostname }}'
+
+- name: Configure Kubelet Servername
+  replace:
+    path: /etc/kubernetes/kubelet
+    regexp: '127.0.0.1:8080'
+    replace: 'hs-wtg-lkub1:8080'
+
+- name: Disable kubelet-pod-infra-container
+  replace:
+    path: /etc/kubernetes/kubelet
+    regexp: 'KUBELET_POD_INFRA_CONTAINER'
+    replace: '# KUBELET_POD_INFRA_CONTAINER'
+
+- name: Set master node in flanneld
+  replace:
+    path: /etc/sysconfig/flanneld
+    regexp: '127.0.0.1'
+    replace: 'hs-wtg-lkub1'
+
+- name: Amend flanneld config etcd prefix
+  replace:
+    path: /etc/sysconfig/flanneld
+    regexp: 'atomic.io'
+    replace: 'kube-centos'
+
+- name: Run daemon-reload
+  systemd: 
+    daemon_reload: yes
+
+- name: Start and enable etcd
+  systemd:
+    name: etcd
+    state: started
+    enabled: True
+
+- name: Start and enable kube-proxy
+  systemd:
+    name: kube-proxy
+    state: started
+    enabled: True
+
+- name: Start and enable kubelet
+  systemd:
+    name: kubelet
+    state: started
+    enabled: True
+
+- name: Start and enable flanneld
+  systemd:
+    name: flanneld
+    state: started
+    enabled: True
+
+- name: Start and enable docker
+  systemd:
+    name: docker
+    state: started
+    enabled: True
+
+- name: Creates Docker cleanup cronjob
+  cron: minute="20" hour="7" weekday="sun"
+        name="Cleanup Docker images"
+        cron_file="docker-cleanup"
+        user="root"
+        job="docker rmi $(docker images --filter "dangling=true" -q --no-trunc)"
+

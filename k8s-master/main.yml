@@ -1,0 +1,283 @@
+---
+# tasks file for k8s-master
+
+- name: Disable SELINUX
+  lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=disabled'
+
+- name: Setenforce
+  selinux:
+    state: disabled
+
+- name: Disable firewalld
+  service: name=firewalld state=stopped enabled=no
+
+- name: Install Git
+  yum: pkg=git state=installed update_cache=true
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: Clone K8s repo
+  git:
+    repo: 'https://github.com/billhartcivica/kubernetes-docker-rpm-repo.git'
+    dest: /home/ansible/kubernetes-docker-rpm-repo
+
+- name: Copy repo to yum
+  command: cp /home/ansible/kubernetes-docker-rpm-repo/virt7-docker-common-release.repo /etc/yum.repos.d
+
+- name: Enable Docker-common repo
+  yum_repository:
+    name: virt7-docker-common-release
+    description: "Docker Common Packages"
+    baseurl: http://cbs.centos.org/repos/virt7-docker-common-release/x86_64/os/
+    enabled: yes
+
+- name: Install K8s Components
+  yum: pkg={{item}} state=installed
+  with_items:
+    - epel-release
+    - ntp
+    - kubernetes
+    - etcd
+    - flannel
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: enable ntp
+  systemd:
+    name: ntpd
+    state: started
+    enabled: True
+
+- name: Install Kompose
+  get_url:
+    url: https://github.com/kubernetes/kompose/releases/download/v1.16.0/kompose-linux-amd64
+    dest: /home/ansible/kompose
+
+- name: Set execute bit on kompose
+  file:
+    path: /home/ansible/kompose
+    owner: root
+    group: root
+    mode: 01755
+
+- name: Move kompose to /usr/local/bin
+  command: cp /home/ansible/kompose /usr/local/bin
+
+- name: Add hosts to /etc/hosts file
+  blockinfile:
+    dest: /etc/hosts
+    block: |
+      10.100.8.51   hs-wtg-lkub1
+      10.100.8.52   hs-wtg-ldok1
+      10.100.8.52   hs-wtg-ldok2
+    backup: no
+
+- name: Amend Kubernetes Config
+  replace:
+    path: /etc/kubernetes/config
+    regexp: '127.0.0.1'
+    replace: '{{ ansible_hostname }}'
+
+- name: set timezone to Europe/London
+  timezone:
+    name: Europe/London
+
+- name: enable kube-apiserver
+  systemd:
+    name: kube-apiserver
+    state: started
+    enabled: True
+
+- name: enable kube-controller-manager
+  systemd:
+    name: kube-controller-manager
+    state: started
+    enabled: True
+
+- name: enable kube-scheduler
+  systemd:
+    name: kube-scheduler
+    state: started
+    enabled: True
+
+- name: enable flanneld
+  systemd:
+    name: flanneld
+    state: started
+    enabled: True
+
+- name: Amend listening IP etcd.conf
+  replace:
+    path: /etc/etcd/etcd.conf
+    regexp: 'localhost'
+    replace: '0.0.0.0'
+
+- name: Amend listening port etcd.conf
+  replace:
+    path: /etc/etcd/etcd.conf
+    regexp: '2380'
+    replace: '2379'
+
+- name: Amend K8s API bind address
+  replace:
+    path: /etc/kubernetes/apiserver
+    regexp: 'bind-address=127.0.0.1'
+    replace: 'bind-address=0.0.0.0'
+
+- name: Amend ETCD server address
+  replace:
+    path: /etc/kubernetes/apiserver
+    regexp: 'http://127.0.0.1'
+    replace: 'http://0.0.0.0'
+
+- name: Remove admission control from apiserver
+  replace:
+    path: /etc/kubernetes/apiserver
+    regexp: 'KUBE_ADMISSION_CONTROL'
+    replace: '# KUBE_ADMISSION_CONTROL'
+
+- name: Start and enable etcd
+  systemd:
+    name: etcd
+    state: started
+    enabled: True
+
+- name: Create network directory
+  file:
+    path: /kube-centos/network
+    state: directory
+    owner: kube
+    group: kube
+    mode: 0775
+    recurse: yes
+
+- name: Configure etcd networking
+  command: 'etcdctl mk /kube-centos/network/config "{ \"Network\": \"172.30.0.0/16\", \"SubnetLen\": 24, \"Backend\": { \"Type\": \"vxlan\" } }"'
+
+- name: Amend flanneld config etcd endpoint IP
+  replace:
+    path: /etc/sysconfig/flanneld
+    regexp: '127.0.0.1'
+    replace: '0.0.0.0'
+
+- name: Amend flanneld config etcd prefix
+  replace:
+    path: /etc/sysconfig/flanneld
+    regexp: 'atomic.io'
+    replace: 'kube-centos'
+
+- name: Run daemon-reload
+  systemd: 
+    daemon_reload: yes
+
+- name: Restart kube-api
+  systemd:
+    state: restarted
+    daemon_reload: yes
+    name: kube-apiserver
+
+- name: Restart kube-controller
+  systemd:
+    state: restarted
+    daemon_reload: yes
+    name: kube-controller-manager
+
+- name: Restart kube-scheduler
+  systemd:
+    state: restarted
+    daemon_reload: yes
+    name: kube-scheduler
+
+- name: Restart flanneld
+  systemd:
+    state: restarted
+    daemon_reload: yes
+    name: flanneld
+
+- name: Configure cluster-default-context
+  command: kubectl config set-cluster default-cluster --server=http://hs-wtg-lkub1:8080
+
+- name: Configure context-default-context
+  command: kubectl config set-context default-context --cluster=default-cluster --user=default-admin
+
+- name: Install nodejs
+  yum: pkg=nodejs state=installed
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: Install HAProxy
+  yum: pkg=haproxy state=installed
+  when: ansible_distribution == "CentOS" and ansible_distribution_major_version == '7'
+
+- name: Configure default-context in K8s
+  command: kubectl config use-context default-context
+
+- name: Add systemd file for starting Github on boot
+  blockinfile:
+    dest: /etc/systemd/system/gitlab-ce.service
+    block: |
+      [Unit]
+      Description=Gitlab-CE Container Service
+      
+      [Service]
+      User=root
+      ExecStart=/etc/k8s/gitlab/start.sh
+      TimeoutSec=30
+      Restart=on-failure
+      
+      [Install]
+      WantedBy=multi-user.target
+    backup: no
+
+- name: Add HAProxy config for Gitlab and Mattermost
+  blockinfile:
+    dest: /etc/haproxy/haproxy.cfg
+    block: |
+      global
+              log 127.0.0.1   local0
+              log 127.0.0.1   local1 notice
+              maxconn 4096
+              user haproxy
+              group haproxy
+              daemon
+      
+      defaults
+              log     global
+              mode    http
+              option  httplog
+              option  dontlognull
+              option forwardfor
+              option http-server-close
+              stats enable
+              stats auth someuser:somepassword
+              stats uri /haproxyStats
+      
+      frontend http-in
+              bind *:80
+      
+              # Define hosts
+              acl host_gitlab hdr(host) -i gitlab.zion.local
+              acl host_mattermost hdr(host) -i mattermost.zion.local
+      
+              ## figure out which one to use
+              use_backend gitlab_cluster if host_gitlab
+              use_backend mattermost_cluster if host_mattermost
+      
+      backend gitlab_cluster
+              balance leastconn
+              option httpclose
+              option forwardfor
+              cookie JSESSIONID prefix
+              server node1 10.100.8.52:30080 cookie A check
+              server node1 10.100.8.53:30080 cookie A check
+      
+      backend mattermost_cluster
+              balance leastconn
+              option httpclose
+              option forwardfor
+              cookie JSESSIONID prefix
+              server node1 10.100.8.52:30080 cookie A check
+              server node1 10.100.8.53:30080 cookie A check
+    backup: no
+
+
